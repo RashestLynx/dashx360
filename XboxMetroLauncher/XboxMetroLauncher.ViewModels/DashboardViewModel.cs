@@ -73,6 +73,10 @@ public sealed class DashboardViewModel : ObservableObject
 
 	private readonly ISteamLibraryScannerService _steamLibraryScannerService;
 
+	private readonly Xbox360LibraryScannerService _xbox360LibraryScannerService = new Xbox360LibraryScannerService();
+
+	private bool _hadRunningGame;
+
 	private readonly ISteamCommunityService _steamCommunityService;
 
 	private readonly IThemeService _themeService;
@@ -2632,6 +2636,8 @@ public sealed class DashboardViewModel : ObservableObject
 
 	public ICommand ScanSteamGamesCommand { get; }
 
+	public ICommand ScanXbox360GamesCommand { get; }
+
 	public ICommand OpenSteamSetupCommand { get; }
 
 	public ICommand CloseSteamSetupCommand { get; }
@@ -2977,6 +2983,7 @@ public sealed class DashboardViewModel : ObservableObject
 		ExportDataCommand = new AsyncRelayCommand(ExportDataAsync);
 		ImportDataCommand = new AsyncRelayCommand(ImportDataAsync);
 		ScanSteamGamesCommand = new AsyncRelayCommand(ScanSteamGamesAsync);
+		ScanXbox360GamesCommand = new AsyncRelayCommand(ScanXbox360GamesAsync);
 		OpenSteamSetupCommand = new AsyncRelayCommand(OpenSteamSetupAsync);
 		CloseSteamSetupCommand = new RelayCommand((Action)delegate
 		{
@@ -3204,6 +3211,8 @@ public sealed class DashboardViewModel : ObservableObject
 		await RefreshDashPartyLinkSetupAsync();
 		_ = RefreshTopRightFriendCountAsync();
 		await _settingsService.SaveAsync(Settings);
+		BringDashboardToFront();
+		await RefreshXbox360GamesSilentlyAsync();
 	}
 
 	public async Task LoadStartupSettingsAsync()
@@ -5759,6 +5768,35 @@ public sealed class DashboardViewModel : ObservableObject
 		}
 	}
 
+	// Like the console, ending a game (from the Guide, the game's own menu, or closing Xenia)
+	// lands back on the dashboard instead of the Windows desktop.
+	private void ReturnToDashboardAfterGame()
+	{
+		BringDashboardToFront();
+		_audioService.Play("menu-in");
+	}
+
+	// The dashboard only takes controller input while it is the active window.
+	public void BringDashboardToFront()
+	{
+		Window window = System.Windows.Application.Current?.MainWindow;
+		if (window == null)
+		{
+			return;
+		}
+		window.Show();
+		if (window.WindowState == WindowState.Minimized)
+		{
+			window.WindowState = (Settings.StartFullscreen ? WindowState.Maximized : WindowState.Normal);
+		}
+		// Windows refuses focus changes from background apps; a brief Topmost flip gets past that.
+		window.Topmost = true;
+		window.Activate();
+		SetForegroundWindow(new System.Windows.Interop.WindowInteropHelper(window).Handle);
+		window.Topmost = false;
+		window.Focus();
+	}
+
 	private static async Task BringLaunchedGameToForegroundAsync(Process? process)
 	{
 		if (process == null)
@@ -8047,6 +8085,74 @@ public sealed class DashboardViewModel : ObservableObject
 		}
 	}
 
+	private async Task ScanXbox360GamesAsync()
+	{
+		try
+		{
+			if (string.IsNullOrWhiteSpace(Settings.XeniaExecutablePath) || !File.Exists(Settings.XeniaExecutablePath))
+			{
+				System.Windows.MessageBox.Show("Choose your Xenia executable (xenia_canary.exe).", "Scan Xbox 360 Games", MessageBoxButton.OK, MessageBoxImage.Asterisk);
+				string text = _filePickerService.PickExecutable();
+				if (string.IsNullOrWhiteSpace(text))
+				{
+					return;
+				}
+				Settings.XeniaExecutablePath = text;
+			}
+			if (string.IsNullOrWhiteSpace(Settings.Xbox360GamesFolder) || !Directory.Exists(Settings.Xbox360GamesFolder))
+			{
+				System.Windows.MessageBox.Show("Choose the folder that holds your Xbox 360 games (.iso).", "Scan Xbox 360 Games", MessageBoxButton.OK, MessageBoxImage.Asterisk);
+				string text2 = _filePickerService.PickFolder();
+				if (string.IsNullOrWhiteSpace(text2))
+				{
+					return;
+				}
+				Settings.Xbox360GamesFolder = text2;
+			}
+			await _settingsService.SaveAsync(Settings);
+			StatusMessage = "Scanning Xbox 360 games...";
+			SteamGameScanResult result = await ApplyXbox360ScanAsync();
+			StatusMessage = result.Message;
+			System.Windows.MessageBox.Show($"{result.Message}{Environment.NewLine}{Environment.NewLine}Added: {result.Added}{Environment.NewLine}Updated: {result.Updated}{Environment.NewLine}Skipped: {result.Skipped}", "Scan Xbox 360 Games", MessageBoxButton.OK, (result.Added > 0 || result.Updated > 0) ? MessageBoxImage.Asterisk : MessageBoxImage.Exclamation);
+		}
+		catch (Exception ex)
+		{
+			App.LogException(ex, "DashboardViewModel.ScanXbox360GamesAsync");
+			StatusMessage = "Xbox 360 scan failed";
+			System.Windows.MessageBox.Show("Xbox 360 scan failed." + Environment.NewLine + Environment.NewLine + ex.Message, "Scan Xbox 360 Games", MessageBoxButton.OK, MessageBoxImage.Hand);
+		}
+	}
+
+	// Like a console, newly copied games show up on their own once Xenia and the games folder are set.
+	private async Task RefreshXbox360GamesSilentlyAsync()
+	{
+		if (!File.Exists(Settings.XeniaExecutablePath) || !Directory.Exists(Settings.Xbox360GamesFolder))
+		{
+			return;
+		}
+		try
+		{
+			await ApplyXbox360ScanAsync();
+		}
+		catch (Exception ex)
+		{
+			App.LogException(ex, "DashboardViewModel.RefreshXbox360GamesSilentlyAsync");
+		}
+	}
+
+	private async Task<SteamGameScanResult> ApplyXbox360ScanAsync()
+	{
+		SteamGameScanResult result = await _xbox360LibraryScannerService.ScanAsync(_library, Settings.XeniaExecutablePath, Settings.Xbox360GamesFolder);
+		if (result.Added > 0 || result.Updated > 0)
+		{
+			SyncGamesCollectionFromLibrary();
+			RefreshDerivedLists();
+			SortGamesByTitle(SelectedGame?.Game.Id);
+			await PersistLibraryAsync();
+		}
+		return result;
+	}
+
 	private async Task LoadThemesAsync()
 	{
 		IReadOnlyList<DashboardTheme> obj = await _themeService.LoadThemesAsync();
@@ -9192,6 +9298,12 @@ public sealed class DashboardViewModel : ObservableObject
 		OnPropertyChanged("HasRunningLaunchedGame");
 		OnPropertyChanged("RunningLaunchedGameTitle");
 		OnPropertyChanged("RunningGameFooterActionText");
+		bool hasRunningGame = _runningGameService.HasRunningGame;
+		if (_hadRunningGame && !hasRunningGame)
+		{
+			ReturnToDashboardAfterGame();
+		}
+		_hadRunningGame = hasRunningGame;
 		if (!_runningGameService.ConsumePlaytimeUpdate())
 		{
 			return;

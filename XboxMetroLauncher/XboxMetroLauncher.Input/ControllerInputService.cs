@@ -19,6 +19,14 @@ public sealed class ControllerInputService : IDisposable
 		public XInputGamepad Gamepad;
 	}
 
+	// XInputGetStateEx writes four bytes more than XInputGetState.
+	private struct XInputStateEx
+	{
+		public XInputState State;
+
+		public uint Reserved;
+	}
+
 	private struct XInputGamepad
 	{
 		public ushort Buttons;
@@ -102,6 +110,8 @@ public sealed class ControllerInputService : IDisposable
 
 	private const ushort XinputGamepadLeftThumb = 64;
 
+	private const ushort XinputGamepadGuide = 1024;
+
 	private const ushort XinputGamepadLeftShoulder = 256;
 
 	private const ushort XinputGamepadRightShoulder = 512;
@@ -167,6 +177,8 @@ public sealed class ControllerInputService : IDisposable
 	private DateTimeOffset _directInputRetryAfter = DateTimeOffset.MinValue;
 
 	private bool _isRunning;
+
+	private bool _xInputExAvailable = true;
 
 	public bool IsRunning => _isRunning;
 
@@ -239,20 +251,36 @@ public sealed class ControllerInputService : IDisposable
 	{
 		try
 		{
+			// Like the console, every connected pad can drive the dashboard: buttons are combined and
+			// the stick pushed furthest wins. (Steam and virtual pads often leave an idle pad in slot 0.)
+			bool found = false;
+			state = default(XInputState);
+			int bestStick = -1;
 			for (int i = 0; i < 4; i++)
 			{
-				if (XInputGetState(i, out state) == 0)
+				if (!TryGetXInputState(i, out var padState))
 				{
-					if (_activeXInputUserIndex != i)
-					{
-						_activeXInputUserIndex = i;
-						_previousButtons = 0;
-						_previousState = default(XInputState);
-						_previousStickAction = null;
-					}
-					SwitchBackend(InputBackend.XInput);
-					return true;
+					continue;
 				}
+				found = true;
+				state.Gamepad.Buttons |= padState.Gamepad.Buttons;
+				state.Gamepad.LeftTrigger = Math.Max(state.Gamepad.LeftTrigger, padState.Gamepad.LeftTrigger);
+				state.Gamepad.RightTrigger = Math.Max(state.Gamepad.RightTrigger, padState.Gamepad.RightTrigger);
+				int stick = Math.Max(Math.Abs((int)padState.Gamepad.LeftThumbX), Math.Abs((int)padState.Gamepad.LeftThumbY));
+				if (stick > bestStick)
+				{
+					bestStick = stick;
+					state.Gamepad.LeftThumbX = padState.Gamepad.LeftThumbX;
+					state.Gamepad.LeftThumbY = padState.Gamepad.LeftThumbY;
+					state.Gamepad.RightThumbX = padState.Gamepad.RightThumbX;
+					state.Gamepad.RightThumbY = padState.Gamepad.RightThumbY;
+				}
+			}
+			if (found)
+			{
+				_activeXInputUserIndex = 0;
+				SwitchBackend(InputBackend.XInput);
+				return true;
 			}
 		}
 		catch (Exception ex) when (((ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException || ex is SEHException) ? 1 : 0) != 0)
@@ -262,6 +290,25 @@ public sealed class ControllerInputService : IDisposable
 		}
 		state = default(XInputState);
 		return false;
+	}
+
+	// The public XInputGetState hides the Guide button; the undocumented ordinal 100 reports it.
+	private bool TryGetXInputState(int userIndex, out XInputState state)
+	{
+		if (_xInputExAvailable)
+		{
+			try
+			{
+				int result = XInputGetStateEx(userIndex, out var stateEx);
+				state = stateEx.State;
+				return result == ErrorSuccess;
+			}
+			catch (EntryPointNotFoundException)
+			{
+				_xInputExAvailable = false;
+			}
+		}
+		return XInputGetState(userIndex, out state) == ErrorSuccess;
 	}
 
 	private bool TryPollDirectInput(out JoystickState state)
@@ -345,7 +392,7 @@ public sealed class ControllerInputService : IDisposable
 	{
 		ushort buttons = state.Gamepad.Buttons;
 		ushort num = 48;
-		if ((buttons & num) == num)
+		if ((buttons & num) == num || (buttons & XinputGamepadGuide) != 0)
 		{
 			if (!_guideButtonDown)
 			{
@@ -702,4 +749,7 @@ public sealed class ControllerInputService : IDisposable
 
 	[DllImport("xinput1_4.dll")]
 	private static extern int XInputGetState(int dwUserIndex, out XInputState pState);
+
+	[DllImport("xinput1_4.dll", EntryPoint = "#100")]
+	private static extern int XInputGetStateEx(int dwUserIndex, out XInputStateEx pState);
 }

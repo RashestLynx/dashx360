@@ -58,6 +58,10 @@ public sealed class AppSettings : ObservableObject
 
 	private string _dashboardTileColor = "#FF028D02";
 
+	private string _xeniaExecutablePath = string.Empty;
+
+	private string _xbox360GamesFolder = string.Empty;
+
 	private SocialIntegrationMode _socialIntegrationMode;
 
 	private DiscordConnectionState _discordConnectionState;
@@ -347,6 +351,30 @@ public sealed class AppSettings : ObservableObject
 		set
 		{
 			SetProperty(ref _dashboardTileColor, value, "DashboardTileColor");
+		}
+	}
+
+	public string XeniaExecutablePath
+	{
+		get
+		{
+			return _xeniaExecutablePath;
+		}
+		set
+		{
+			SetProperty(ref _xeniaExecutablePath, value ?? string.Empty, "XeniaExecutablePath");
+		}
+	}
+
+	public string Xbox360GamesFolder
+	{
+		get
+		{
+			return _xbox360GamesFolder;
+		}
+		set
+		{
+			SetProperty(ref _xbox360GamesFolder, value ?? string.Empty, "Xbox360GamesFolder");
 		}
 	}
 
