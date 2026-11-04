@@ -18,10 +18,6 @@ public sealed class Xbox360LibraryScannerService
 {
 	public const string PlatformName = "Xbox 360";
 
-	public const string CombinedFolderName = "Combined";
-
-	public const string CombinedMarkerName = "combined-from.txt";
-
 	private const int SectorSize = 0x800;
 
 	// XGD partition offsets: plain XDVDFS/XSF, XGD3, XGD2, XGD1.
@@ -34,7 +30,9 @@ public sealed class Xbox360LibraryScannerService
 
 	private static readonly HashSet<string> LauncherDiscRootNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "default.xex", "media", "Content", "$SystemUpdate", "$TitleUpdate", "AvatarAssetPack", "nxeart" };
 
-	private static readonly Regex DiscTag = new Regex("\\(Disc (\\d+)\\)(?:\\s*\\(([^)]*)\\))?", RegexOptions.IgnoreCase);
+	private static readonly Regex MultiplayerDisc = new Regex("\\((Multiplayer|MP)\\)", RegexOptions.IgnoreCase);
+
+	private static readonly Regex DiscTag =new Regex("\\(Disc (\\d+)\\)(?:\\s*\\(([^)]*)\\))?", RegexOptions.IgnoreCase);
 
 	private static readonly HttpClient HttpClient = new HttpClient
 	{
@@ -61,89 +59,88 @@ public sealed class Xbox360LibraryScannerService
 				Message = "The Xbox 360 games folder was not found."
 			};
 		}
-		// Combined multi-disc games (built by tools\DiscMerger) replace the discs they came from.
-		// combined-from.txt is written last, so a half-built folder is ignored.
-		HashSet<string> supersededDiscs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-		HashSet<string> combinedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-		string combinedRoot = Path.Combine(gamesFolder, CombinedFolderName);
-		if (Directory.Exists(combinedRoot))
-		{
-			foreach (string folder in Directory.EnumerateDirectories(combinedRoot))
-			{
-				string marker = Path.Combine(folder, CombinedMarkerName);
-				if (File.Exists(marker))
-				{
-					combinedFolders.Add(folder);
-					supersededDiscs.UnionWith(File.ReadAllLines(marker).Where((string line) => !string.IsNullOrWhiteSpace(line)).Select((string line) => line.Trim()));
-				}
-			}
-		}
-		List<string> isoPaths = Directory.EnumerateFiles(gamesFolder, "*.*", SearchOption.AllDirectories).Where((string path) => IsGameImage(path, combinedRoot, combinedFolders)).OrderBy((string path) => path, StringComparer.OrdinalIgnoreCase)
+		List<string> imagePaths = Directory.EnumerateFiles(gamesFolder, "*.*", SearchOption.AllDirectories).Where(IsGameImage).OrderBy((string path) => path, StringComparer.OrdinalIgnoreCase)
 			.ToList();
 		Directory.CreateDirectory(ArtFolder);
+		string installedContent = Path.Combine(Path.GetDirectoryName(xeniaPath) ?? string.Empty, "content", "0000000000000000");
+		List<DiscInfo> discs = new List<DiscInfo>();
+		foreach (string path in imagePaths)
+		{
+			cancellationToken.ThrowIfCancellationRequested();
+			DiscInfo? disc = await Task.Run(() => InspectDisc(path, installedContent), cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
+			if (disc != null)
+			{
+				discs.Add(disc);
+			}
+		}
+		MarkHiddenDiscs(discs);
+
 		int added = 0;
 		int updated = 0;
 		int skipped = 0;
-		List<GameMetadata> retired = library.Games.Where((GameMetadata existing) => string.Equals(existing.Platform, PlatformName, StringComparison.OrdinalIgnoreCase) && supersededDiscs.Contains(Path.GetFileNameWithoutExtension(existing.InstallPath))).ToList();
-		foreach (GameMetadata disc in retired)
+		// Tiles for discs that are now hidden, or whose file is gone, hand their play history to the game's main tile.
+		HashSet<string> visiblePaths = new HashSet<string>(discs.Where((DiscInfo disc) => disc.HiddenReason == null).Select((DiscInfo disc) => disc.Path), StringComparer.OrdinalIgnoreCase);
+		List<GameMetadata> retired = library.Games.Where((GameMetadata existing) => string.Equals(existing.Platform, PlatformName, StringComparison.OrdinalIgnoreCase) && !visiblePaths.Contains(existing.InstallPath)).ToList();
+		foreach (GameMetadata tile in retired)
 		{
-			library.Games.Remove(disc);
+			library.Games.Remove(tile);
 			updated++;
 		}
-		foreach (string isoPath in isoPaths)
+		foreach (DiscInfo disc in discs)
 		{
 			cancellationToken.ThrowIfCancellationRequested();
-			bool isFolderGame = isoPath.EndsWith(".xex", StringComparison.OrdinalIgnoreCase);
-			string fileName = isFolderGame ? Path.GetFileName(Path.GetDirectoryName(isoPath)) ?? string.Empty : Path.GetFileNameWithoutExtension(isoPath);
-			if (supersededDiscs.Contains(fileName))
+			if (disc.HiddenReason != null)
 			{
 				skipped++;
 				continue;
 			}
-			if (DataOnlyDisc.IsMatch(fileName))
-			{
-				skipped++;
-				continue;
-			}
-			string titleId = await Task.Run(() => TryReadTitleId(isoPath), cancellationToken).ConfigureAwait(continueOnCapturedContext: false) ?? string.Empty;
-			string launchPath = isFolderGame ? ResolveDiscLauncher(isoPath) : isoPath;
-			string? packagePath = await Task.Run(() => TryExtractDiscPackage(isoPath), cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
+			string titleId = disc.TitleId ?? string.Empty;
+			string launchPath = disc.Path;
+			string? packagePath = await Task.Run(() => TryExtractDiscPackage(disc.Path), cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
 			if (packagePath != null)
 			{
 				launchPath = packagePath;
 				titleId = TryReadPackageTitleId(packagePath) ?? titleId;
 			}
 			string coverPath = await EnsureBoxArtAsync(titleId, cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
-			GameMetadata? game = library.Games.FirstOrDefault((GameMetadata existing) => string.Equals(existing.Platform, PlatformName, StringComparison.OrdinalIgnoreCase) && string.Equals(existing.InstallPath, isoPath, StringComparison.OrdinalIgnoreCase));
+			// A game whose other discs are hidden is just "the game", not "Disc 2 (Play)".
+			bool hasHiddenSiblings = discs.Any((DiscInfo other) => other.HiddenReason != null && other.GameTitleIds.Overlaps(disc.GameTitleIds));
+			string title = CleanTitle(disc.Name, !hasHiddenSiblings);
+			GameMetadata? game = library.Games.FirstOrDefault((GameMetadata existing) => string.Equals(existing.Platform, PlatformName, StringComparison.OrdinalIgnoreCase) && string.Equals(existing.InstallPath, disc.Path, StringComparison.OrdinalIgnoreCase));
 			if (game == null)
 			{
 				game = new GameMetadata
 				{
-					Title = CleanTitle(fileName),
+					Title = title,
 					Platform = PlatformName,
 					Genre = "Xbox 360",
-					InstallPath = isoPath
+					InstallPath = disc.Path
 				};
-				// Keep the play history of the separate discs this combined game replaced.
-				foreach (GameMetadata disc in retired.Where((GameMetadata disc) => isFolderGame && File.ReadAllLines(Path.Combine(Path.GetDirectoryName(isoPath)!, CombinedMarkerName)).Any((string line) => string.Equals(line.Trim(), Path.GetFileNameWithoutExtension(disc.InstallPath), StringComparison.OrdinalIgnoreCase))))
-				{
-					game.Playtime += disc.Playtime;
-					if (disc.LastPlayed > game.LastPlayed || !game.LastPlayed.HasValue)
-					{
-						game.LastPlayed = disc.LastPlayed;
-					}
-					game.IsFavorite |= disc.IsFavorite;
-				}
 				library.Games.Add(game);
 				added++;
 			}
 			else
 			{
+				// Only replace names the scanner made itself, never one the user typed.
+				if (string.Equals(game.Title, CleanTitle(disc.Name, includeDisc: true), StringComparison.Ordinal))
+				{
+					game.Title = title;
+				}
 				updated++;
+			}
+			foreach (GameMetadata tile in retired.Where((GameMetadata tile) => string.Equals(BaseTitle(tile.Title), BaseTitle(title), StringComparison.OrdinalIgnoreCase)).ToList())
+			{
+				game.Playtime += tile.Playtime;
+				if (!game.LastPlayed.HasValue || tile.LastPlayed > game.LastPlayed)
+				{
+					game.LastPlayed = tile.LastPlayed;
+				}
+				game.IsFavorite |= tile.IsFavorite;
+				retired.Remove(tile);
 			}
 			game.LaunchType = "Exe";
 			game.ExecutablePath = xeniaPath;
-			game.Arguments = "\"" + launchPath + "\" --fullscreen=true";
+			game.Arguments = "\"" + launchPath + "\"" + (packagePath == null && disc.BootModule != null ? " --launch_module=\"" + disc.BootModule + "\"" : string.Empty) + " --fullscreen=true";
 			game.WorkingDirectory = Path.GetDirectoryName(xeniaPath) ?? string.Empty;
 			if (!string.IsNullOrWhiteSpace(coverPath) && (string.IsNullOrWhiteSpace(game.CoverArtPath) || (packagePath != null && game.CoverArtPath.StartsWith(ArtFolder, StringComparison.OrdinalIgnoreCase))))
 			{
@@ -155,32 +152,163 @@ public sealed class Xbox360LibraryScannerService
 			Added = added,
 			Updated = updated,
 			Skipped = skipped,
-			Message = ((isoPaths.Count == 0) ? "No Xbox 360 games were found." : $"Xbox 360 scan complete. Added: {added}, Updated: {updated}, Skipped: {skipped}.")
+			Message = ((imagePaths.Count == 0) ? "No Xbox 360 games were found." : $"Xbox 360 scan complete. Added: {added}, Updated: {updated}, Skipped: {skipped}.")
 		};
 	}
 
-	// Some publishers (e.g. Ubisoft's x360disclauncher) ship a tiny default.xex that only starts the
-	// real game xex. Xenia stops at that hand-off, so boot the biggest game xex beside it instead.
-	private static string ResolveDiscLauncher(string defaultXex)
+	private sealed class DiscInfo
 	{
+		public required string Path { get; init; }
+
+		public required string Name { get; init; }
+
+		public string? TitleId { get; init; }
+
+		// Install/add-on packages (content type 00000002) on the disc: their game's title, and whether Xenia has them.
+		public List<(string titleId, bool installed)> ContentPackages { get; } = new List<(string, bool)>();
+
+		// The disc boots an arcade package (Minecraft-style launcher disc) rather than a xex.
+		public bool BootsPackage { get; set; }
+
+		// For Ubisoft-style disc launchers: the real game xex on the disc.
+		public string? BootModule { get; set; }
+
+		// A "multi" folder at the root holds multiplayer data (Ubisoft's AC III/IV multiplayer discs).
+		public bool HasMultiplayerData { get; set; }
+
+		public bool IsMultiplayerDisc => (MultiplayerDisc.IsMatch(Name) && !Regex.IsMatch(Name, "single", RegexOptions.IgnoreCase)) || HasMultiplayerData;
+
+		public string? HiddenReason { get; set; }
+
+		// The games this disc belongs to: its own title plus the titles its packages install into.
+		public HashSet<string> GameTitleIds { get; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+	}
+
+	// Like a console's hard drive: once an install/content/add-on disc's packages are installed in
+	// Xenia, the game only needs its main disc, so the extra disc stops showing as a separate game.
+	private static void MarkHiddenDiscs(List<DiscInfo> discs)
+	{
+		foreach (DiscInfo disc in discs)
+		{
+			if (DataOnlyDisc.IsMatch(disc.Name))
+			{
+				disc.HiddenReason = "data disc";
+			}
+		}
+		foreach (DiscInfo disc in discs.Where((DiscInfo disc) => disc.HiddenReason == null && !disc.BootsPackage && disc.ContentPackages.Count > 0))
+		{
+			bool allInstalled = disc.ContentPackages.All(((string titleId, bool installed) package) => package.installed);
+			HashSet<string> packageGames = disc.ContentPackages.Select(((string titleId, bool installed) package) => package.titleId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+			// Only when the game has a separate play disc of its own, so a single disc that also carries DLC never disappears.
+			bool gameHasPlayDisc = discs.Any((DiscInfo other) => other != disc && other.TitleId != null && packageGames.Contains(other.TitleId) && other.ContentPackages.Count == 0 && !DataOnlyDisc.IsMatch(other.Name));
+			if (allInstalled && gameHasPlayDisc)
+			{
+				disc.HiddenReason = "content installed";
+			}
+		}
+		// A separate multiplayer disc (AC III, AC IV) is hidden when the same game has a single-player disc.
+		foreach (DiscInfo disc in discs.Where((DiscInfo disc) => disc.HiddenReason == null && disc.IsMultiplayerDisc))
+		{
+			if (discs.Any((DiscInfo other) => other != disc && other.HiddenReason == null && !other.IsMultiplayerDisc && other.TitleId != null && string.Equals(other.TitleId, disc.TitleId, StringComparison.OrdinalIgnoreCase)))
+			{
+				disc.HiddenReason = "multiplayer disc";
+			}
+		}
+	}
+
+	private static DiscInfo? InspectDisc(string path, string installedContent)
+	{
+		string name = path.EndsWith(".xex", StringComparison.OrdinalIgnoreCase) ? System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(path)) ?? string.Empty : System.IO.Path.GetFileNameWithoutExtension(path);
+		DiscInfo info = new DiscInfo
+		{
+			Path = path,
+			Name = name,
+			TitleId = TryReadTitleId(path)
+		};
+		if (info.TitleId != null)
+		{
+			info.GameTitleIds.Add(info.TitleId);
+		}
+		if (!path.EndsWith(".iso", StringComparison.OrdinalIgnoreCase))
+		{
+			return info;
+		}
 		try
 		{
-			byte[] header = File.ReadAllBytes(defaultXex).AsSpan(0, (int)Math.Min(new FileInfo(defaultXex).Length, 0x10000L)).ToArray();
-			string? originalName = ReadXexOriginalName(header);
-			if (originalName == null || originalName.IndexOf("disclauncher", StringComparison.OrdinalIgnoreCase) < 0)
+			using FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+			(long partition, byte[] root)? disc = OpenDisc(stream);
+			if (!disc.HasValue)
 			{
-				return defaultXex;
+				return info;
 			}
-			string? game = Directory.EnumerateFiles(Path.GetDirectoryName(defaultXex)!, "*.xex")
-				.Where((string path) => !string.Equals(path, defaultXex, StringComparison.OrdinalIgnoreCase) && !Path.GetFileName(path).StartsWith("Uplay", StringComparison.OrdinalIgnoreCase))
-				.OrderByDescending((string path) => new FileInfo(path).Length)
-				.FirstOrDefault();
-			return game ?? defaultXex;
+			info.BootModule = FindDiscLauncherTarget(stream, disc.Value.partition, disc.Value.root);
+			info.HasMultiplayerData = FindEntry(disc.Value.root, "multi")?.IsDirectory == true;
+			DirectoryEntry? content = FindEntry(disc.Value.root, "Content");
+			if (content == null || !content.IsDirectory)
+			{
+				return info;
+			}
+			List<(string path, DirectoryEntry entry)> files = new List<(string, DirectoryEntry)>();
+			CollectFiles(stream, disc.Value.partition, content, "Content", files, 0);
+			foreach ((string filePath, DirectoryEntry entry) in files)
+			{
+				byte[] header = ReadAt(stream, disc.Value.partition + entry.Sector * (long)SectorSize, 0x364);
+				if (header.Length == 0 || !IsPackageMagic(header))
+				{
+					continue;
+				}
+				string contentType = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(0x344)).ToString("X8");
+				string titleId = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(0x360)).ToString("X8");
+				string packageName = filePath.Split('\\')[^1];
+				if (contentType == "000D0000")
+				{
+					info.BootsPackage |= !EnumerateEntries(disc.Value.root).Any((DirectoryEntry rootEntry) => !LauncherDiscRootNames.Contains(rootEntry.Name));
+				}
+				else if (contentType == "00000002")
+				{
+					bool installed = File.Exists(System.IO.Path.Combine(installedContent, titleId, "Headers", contentType, packageName + ".header"));
+					info.ContentPackages.Add((titleId, installed));
+					info.GameTitleIds.Add(titleId);
+				}
+			}
 		}
 		catch (Exception)
 		{
-			return defaultXex;
 		}
+		return info;
+	}
+
+	// Some publishers (e.g. Ubisoft's x360disclauncher) ship a tiny default.xex that only starts the
+	// real game xex. Xenia stops at that hand-off, so name the biggest game xex on the disc instead
+	// (passed to Xenia as --launch_module).
+	private static string? FindDiscLauncherTarget(FileStream stream, long partition, byte[] root)
+	{
+		DirectoryEntry? defaultXex = FindEntry(root, "default.xex");
+		if (defaultXex == null)
+		{
+			return null;
+		}
+		string? originalName = ReadXexOriginalName(ReadAt(stream, partition + defaultXex.Sector * (long)SectorSize, (int)Math.Min(defaultXex.Size, 0x10000u)));
+		if (originalName == null || originalName.IndexOf("disclauncher", StringComparison.OrdinalIgnoreCase) < 0)
+		{
+			return null;
+		}
+		return EnumerateEntries(root)
+			.Where((DirectoryEntry entry) => !entry.IsDirectory && entry.Name.EndsWith(".xex", StringComparison.OrdinalIgnoreCase) && !string.Equals(entry.Name, "default.xex", StringComparison.OrdinalIgnoreCase) && !entry.Name.StartsWith("Uplay", StringComparison.OrdinalIgnoreCase))
+			.OrderByDescending((DirectoryEntry entry) => entry.Size)
+			.FirstOrDefault()?.Name;
+	}
+
+	private static bool IsPackageMagic(byte[] header)
+	{
+		string magic = Encoding.ASCII.GetString(header, 0, 4);
+		return magic == "PIRS" || magic == "LIVE" || magic == "CON ";
+	}
+
+	// "Forza Motorsport 4 (Play Disc)" -> "Forza Motorsport 4", for matching tiles of the same game.
+	private static string BaseTitle(string title)
+	{
+		return Regex.Replace(title, "(\\s*\\([^)]*\\))+\\s*$", string.Empty).Trim();
 	}
 
 	private static string? ReadXexOriginalName(byte[] xex)
@@ -209,27 +337,13 @@ public sealed class Xbox360LibraryScannerService
 		return null;
 	}
 
-	// Disc images anywhere, plus extracted games (a folder holding default.xex). Under Combined\,
-	// only finished folders count.
-	private static bool IsGameImage(string path, string combinedRoot, HashSet<string> combinedFolders)
+	// Disc images, plus extracted games (a folder holding default.xex).
+	private static bool IsGameImage(string path)
 	{
-		if (path.EndsWith(".iso", StringComparison.OrdinalIgnoreCase))
-		{
-			return true;
-		}
-		if (!string.Equals(Path.GetFileName(path), "default.xex", StringComparison.OrdinalIgnoreCase))
-		{
-			return false;
-		}
-		string folder = Path.GetDirectoryName(path) ?? string.Empty;
-		if (folder.StartsWith(combinedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-		{
-			return combinedFolders.Contains(folder);
-		}
-		return true;
+		return path.EndsWith(".iso", StringComparison.OrdinalIgnoreCase) || string.Equals(Path.GetFileName(path), "default.xex", StringComparison.OrdinalIgnoreCase);
 	}
 
-	public static string CleanTitle(string fileName)
+	public static string CleanTitle(string fileName, bool includeDisc = true)
 	{
 		Match disc = DiscTag.Match(fileName);
 		string title = fileName;
@@ -245,7 +359,7 @@ public sealed class Xbox360LibraryScannerService
 			title = article.Groups[2].Value + " " + article.Groups[1].Value + article.Groups[3].Value;
 		}
 		title = title.Replace(" - ", ": ");
-		if (disc.Success)
+		if (disc.Success && includeDisc)
 		{
 			title += (disc.Groups[2].Success ? (" (" + disc.Groups[2].Value + ")") : (" (Disc " + disc.Groups[1].Value + ")"));
 		}
